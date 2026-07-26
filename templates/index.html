@@ -85,6 +85,9 @@ label.chk{display:flex;align-items:center;gap:.35rem;color:#666;font-size:.75rem
 .dim{color:#444;font-size:.7rem}
 
 .empty{text-align:center;color:#444;padding:3rem}
+.pager{max-width:980px;margin:0 auto 1.5rem;padding:0 1.5rem;display:flex;align-items:center;
+  justify-content:center;gap:1rem}
+.pager-label{color:#666;font-size:.75rem}
 .log-box{position:fixed;bottom:.6rem;left:50%;transform:translateX(-50%);z-index:9998;
   background:var(--bg3);border:1px solid var(--bh);border-radius:5px;padding:.5rem 1rem;
   font-size:.75rem;color:var(--g);display:none;max-width:80vw;white-space:pre-wrap}
@@ -107,11 +110,14 @@ label.chk{display:flex;align-items:center;gap:.35rem;color:#666;font-size:.75rem
 </div>
 
 <div class="list" id="list"></div>
+<div class="pager" id="pager"></div>
 
 <div class="log-box" id="log-box"></div>
 
 <script>
+const PAGE_SIZE = 60;
 let ARTISTS = [];
+let currentPage = 0;
 const albumsCache = {};   // artist_id -> albums[]
 const availCache = {};    // release_group_id -> availability result
 
@@ -134,9 +140,30 @@ function showLog(text, isError) {
 
 function passesFilters(a) {
   const q = document.getElementById('search').value.trim().toLowerCase();
-  if (q && !a.name.toLowerCase().includes(q)) return false;
+  // Una búsqueda por nombre activa siempre mira TODO el universo de
+  // artistas, no solo el subconjunto que deja pasar "Solo con discos
+  // pendientes" -- si no, con cientos de artistas (la mayoría sin
+  // discografía sincronizada todavía, missing_count=0) casi nada es
+  // encontrable por nombre hasta que termina el sync completo.
+  if (q) return a.name.toLowerCase().includes(q);
   if (document.getElementById('only-missing').checked && a.missing_count === 0) return false;
   return true;
+}
+
+function renderPager(totalRows, totalPages) {
+  const pager = document.getElementById('pager');
+  pager.innerHTML = '';
+  if (totalPages <= 1) return;
+  const prev = el('button', { className: 'btn btn-small btn-ghost', textContent: '‹ Anterior' });
+  prev.disabled = currentPage === 0;
+  prev.addEventListener('click', () => { currentPage--; renderList(); window.scrollTo(0, 0); });
+  const label = el('span', { className: 'pager-label', textContent: `Página ${currentPage + 1} / ${totalPages}` });
+  const next = el('button', { className: 'btn btn-small btn-ghost', textContent: 'Siguiente ›' });
+  next.disabled = currentPage >= totalPages - 1;
+  next.addEventListener('click', () => { currentPage++; renderList(); window.scrollTo(0, 0); });
+  pager.appendChild(prev);
+  pager.appendChild(label);
+  pager.appendChild(next);
 }
 
 function renderList() {
@@ -148,10 +175,17 @@ function renderList() {
 
   if (!rows.length) {
     list.appendChild(el('div', { className: 'empty', textContent: 'Sin resultados — sincroniza o ajusta los filtros' }));
+    document.getElementById('pager').innerHTML = '';
     return;
   }
 
-  for (const a of rows) {
+  const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+  if (currentPage >= totalPages) currentPage = totalPages - 1;
+  if (currentPage < 0) currentPage = 0;
+  const pageRows = rows.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
+  renderPager(rows.length, totalPages);
+
+  for (const a of pageRows) {
     const wrap = el('div', { className: 'artist', id: `artist-${a.id}` });
     const head = el('div', { className: 'artist-head' });
     const missingClass = a.missing_count === 0 ? 'zero' : 'some';
@@ -262,6 +296,7 @@ async function downloadTorrent(torrentId, btn) {
 
 async function loadArtists() {
   ARTISTS = await api('/api/artists');
+  currentPage = 0;
   renderList();
 }
 
@@ -285,8 +320,8 @@ document.getElementById('sync-btn').addEventListener('click', async () => {
   await loadLastSync();
 });
 
-document.getElementById('search').addEventListener('input', renderList);
-document.getElementById('only-missing').addEventListener('change', renderList);
+document.getElementById('search').addEventListener('input', () => { currentPage = 0; renderList(); });
+document.getElementById('only-missing').addEventListener('change', () => { currentPage = 0; renderList(); });
 
 loadArtists();
 loadLastSync();
