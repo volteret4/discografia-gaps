@@ -91,6 +91,9 @@ label.chk{display:flex;align-items:center;gap:.35rem;color:#666;font-size:.75rem
 .log-box{position:fixed;bottom:.6rem;left:50%;transform:translateX(-50%);z-index:9998;
   background:var(--bg3);border:1px solid var(--bh);border-radius:5px;padding:.5rem 1rem;
   font-size:.75rem;color:var(--g);display:none;max-width:80vw;white-space:pre-wrap}
+.artist-tools { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; padding: .5rem 0 .4rem 2rem; }
+.artist-tools .bulk-status { font-size: .78rem; }
+.avail-checked { font-size: .72rem; margin-left: .3rem; }
 </style>
 </head>
 <body>
@@ -118,8 +121,8 @@ label.chk{display:flex;align-items:center;gap:.35rem;color:#666;font-size:.75rem
 const PAGE_SIZE = 60;
 let ARTISTS = [];
 let currentPage = 0;
-const albumsCache = {};   // artist_id -> albums[]
-const availCache = {};    // release_group_id -> availability result
+const albumsCache = {};   // artist_id -> albums[] (cada uno con su availability guardada)
+let bulkPoller = null;
 
 function el(tag, props) { const e = document.createElement(tag); if (props) Object.assign(e, props); return e; }
 
@@ -212,14 +215,40 @@ async function toggleArtist(wrap, artistId) {
     const data = await api(`/api/artists/${artistId}/albums`);
     albumsCache[artistId] = data.albums || [];
   }
-  renderAlbums(albumsDiv, albumsCache[artistId]);
+  renderAlbums(albumsDiv, albumsCache[artistId], artistId);
+  // Si hay una búsqueda masiva de este artista en curso (p.ej. tras recargar), seguirla
+  const job = await api('/api/availability/job');
+  if (job.running && job.artist_id === artistId) pollBulk(artistId);
 }
 
-function renderAlbums(container, albums) {
+async function reloadArtistAlbums(artistId) {
+  const data = await api(`/api/artists/${artistId}/albums`);
+  albumsCache[artistId] = data.albums || [];
+  const wrap = document.getElementById(`artist-${artistId}`);
+  if (wrap) renderAlbums(wrap.querySelector('.albums'), albumsCache[artistId], artistId);
+}
+
+function renderAlbums(container, albums, artistId) {
   container.innerHTML = '';
   if (!albums.length) {
     container.appendChild(el('div', { className: 'dim', style: 'padding:.6rem 0 .6rem 2rem', textContent: 'Sin discografia sincronizada todavia.' }));
     return;
+  }
+  const missing = albums.filter(al => !al.have);
+  if (missing.length) {
+    const unchecked = missing.filter(al => !al.availability).length;
+    const tools = el('div', { className: 'artist-tools' });
+    const all = el('button', { className: 'btn btn-small btn-ghost',
+      textContent: `🔍 Buscar disponibilidad de todos (${unchecked} sin comprobar)` });
+    all.disabled = unchecked === 0;
+    all.addEventListener('click', () => startBulk(artistId, false));
+    const refresh = el('button', { className: 'btn btn-small btn-ghost',
+      textContent: `↻ Actualizar todos (${missing.length})` });
+    refresh.addEventListener('click', () => startBulk(artistId, true));
+    tools.appendChild(all);
+    tools.appendChild(refresh);
+    tools.appendChild(el('span', { className: 'bulk-status dim' }));
+    container.appendChild(tools);
   }
   for (const al of albums) {
     const row = el('div', { className: 'album-row' + (al.have ? ' have' : ''), id: `album-${al.id}` });
@@ -229,25 +258,70 @@ function renderAlbums(container, albums) {
       <span class="album-type">${al.primary_type || '?'}</span>
       <span class="album-year">${year}</span>
     `;
+    container.appendChild(row);
     if (al.have) {
       row.innerHTML += `<span class="have-badge">${al.have_sources.join(', ')}</span>`;
     } else {
-      const btn = el('button', { className: 'btn btn-small btn-ghost', textContent: '🔍 buscar disponibilidad' });
-      btn.addEventListener('click', () => checkAvailability(al.id, row, btn));
+      // Con resultado guardado el botón es "↻" (vuelve a consultar todo);
+      // sin él, "buscar" (solo consulta lo que falta).
+      const btn = el('button', { className: 'btn btn-small btn-ghost' });
+      setAvailButton(btn, !!al.availability);
+      btn.addEventListener('click', () => checkAvailability(al, row, btn));
       row.appendChild(btn);
+      if (al.availability) renderAvailability(row, al.availability);
     }
-    container.appendChild(row);
   }
 }
 
-async function checkAvailability(releaseGroupId, row, btn) {
+function setAvailButton(btn, checked) {
+  btn.textContent = checked ? '↻' : '🔍 buscar disponibilidad';
+  btn.title = checked ? 'Volver a comprobar la disponibilidad' : '';
+}
+
+async function checkAvailability(al, row, btn) {
+  const refresh = !!al.availability;
   btn.disabled = true; btn.textContent = 'Buscando…';
-  let data = availCache[releaseGroupId];
-  if (!data) {
-    data = await api(`/api/availability/${releaseGroupId}`, { method: 'POST' });
-    availCache[releaseGroupId] = data;
-  }
-  btn.remove();
+  const data = await api(`/api/availability/${al.id}${refresh ? '?refresh=1' : ''}`, { method: 'POST' });
+  if (data.checked_at) al.availability = data;  // ya está en la BD; también en la caché de la página
+  btn.disabled = false;
+  setAvailButton(btn, !!al.availability);
+  renderAvailability(row, data);
+}
+
+async function startBulk(artistId, refresh) {
+  const r = await fetch(`/api/artists/${artistId}/availability`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ refresh }),
+  });
+  const data = await r.json();
+  if (data.error) { showLog(data.error, true); return; }
+  if (!data.total) { showLog('No hay discos que comprobar', false); return; }
+  pollBulk(artistId);
+}
+
+function pollBulk(artistId) {
+  clearInterval(bulkPoller);
+  const tick = async () => {
+    const job = await api('/api/availability/job');
+    const wrap = document.getElementById(`artist-${artistId}`);
+    const status = wrap && wrap.querySelector('.bulk-status');
+    if (status) status.textContent = job.running
+      ? `⏳ ${job.done}/${job.total}${job.current ? ' · ' + job.current : ''}`
+      : '';
+    if (wrap) wrap.querySelectorAll('.artist-tools button').forEach(b => b.disabled = job.running);
+    if (!job.running) {
+      clearInterval(bulkPoller);
+      bulkPoller = null;
+      await reloadArtistAlbums(artistId);
+      showLog(`Disponibilidad comprobada: ${job.done} discos` + (job.errors ? ` (${job.errors} con error en Orpheus)` : ''), job.errors > 0);
+    }
+  };
+  bulkPoller = setInterval(tick, 2000);
+  tick();
+}
+
+function renderAvailability(row, data) {
+  const prev = row.nextElementSibling;
+  if (prev && prev.classList.contains('avail-wrap')) prev.remove();
 
   const availWrap = el('div', { className: 'avail-wrap' });
   const rowEl = el('div', { className: 'avail-row' });
@@ -276,6 +350,11 @@ async function checkAvailability(releaseGroupId, row, btn) {
   if (data.bandcamp && data.bandcamp.url) {
     const a = el('a', { className: 'link-chip bc', href: data.bandcamp.url, target: '_blank', textContent: '♪ Bandcamp' });
     rowEl.appendChild(a);
+  }
+
+  if (data.checked_at) {
+    rowEl.appendChild(el('span', { className: 'dim avail-checked',
+      textContent: 'comprobado ' + new Date(data.checked_at).toLocaleDateString('es-ES') }));
   }
 
   availWrap.appendChild(rowEl);

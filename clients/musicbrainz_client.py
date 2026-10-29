@@ -1,5 +1,5 @@
 """Resuelve el MBID de un artista por nombre, y trae su discografia completa
-(release-groups: Album/EP) desde MusicBrainz."""
+(release-groups: Album/EP/Single) desde MusicBrainz."""
 import time
 
 import requests
@@ -31,7 +31,7 @@ def search_mbid(artist_name, contact_email="admin@localhost"):
     return artists[0].get("id")
 
 
-def discography(artist_mbid, contact_email="admin@localhost", types=("album", "ep")):
+def discography(artist_mbid, contact_email="admin@localhost", types=("album", "ep", "single")):
     """Devuelve [{mbid, title, primary_type, first_release_date}, ...] para
     un artista, paginando y filtrando los secondary-types de
     _EXCLUDED_SECONDARY_TYPES (salvo que ese sea el UNICO tipo listado para

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Para cada artista de tu "universo" (Muspy seguidos ∪ Airsonic biblioteca ∪
 Last.fm por encima de un umbral de scrobbles opcional), calcula su
-discografía completa (Álbumes + EPs vía MusicBrainz release-groups) y marca
+discografía completa (Álbumes + EPs + Singles vía MusicBrainz release-groups) y marca
 qué discos ya tienes (Airsonic + qBittorrent/FLAC) frente a los que te
 faltan. Para un disco que falta, bajo demanda (no en el sync general),
 comprueba si está disponible en Orpheus (tracker privado, descarga vía
@@ -28,7 +28,7 @@ artist_sources(id, artist_id FK, source IN (muspy|airsonic|lastfm))         -- d
 release_groups(id, artist_id FK, mbid UNIQUE, title, norm_title,
                 primary_type, first_release_date, have, have_sources)        -- "disco" = release-group MB
 availability(id, release_group_id FK, source IN (orpheus|youtube|bandcamp),
-             url, meta, checked_at)                                          -- cache BAJO DEMANDA
+             url, meta, checked_at)                                          -- BAJO DEMANDA, 1 fila por fuente, no caduca
 ```
 
 `scan.py` reemplaza por completo `artist_sources` por fuente en cada sync
@@ -38,17 +38,21 @@ por delante su `release_groups`/`availability`.
 
 ## Key Logic Notes
 
-- **`availability` es perezosa**: `scan.py` NUNCA llama a Orpheus/YouTube/
-  Bandcamp — eso solo pasa desde `/api/availability/<id>` cuando el usuario
-  expande un disco que falta en la web, y se cachea `AVAILABILITY_CACHE_DAYS`
-  (7 días, en `app.py`) para no repetir scraping/rate-limit de Orpheus en
-  cada visita.
+- **`availability` es perezosa y persistente**: `scan.py` NUNCA llama a
+  Orpheus/YouTube/Bandcamp — eso solo pasa desde `/api/availability/<id>`
+  (un disco) o `/api/artists/<id>/availability` (todos los que faltan de un
+  artista, hilo en segundo plano, uno a la vez, progreso en
+  `/api/availability/job`). El resultado se guarda sin caducidad (una fila
+  por disco y fuente) y se devuelve con la discografía;
+  `?refresh=1` / `{"refresh": true}` vuelve a consultarlo. El re-sync de
+  discografía hace upsert por `mbid`, así que no la borra (solo se pierde
+  si el artista sale del universo, por el `ON DELETE CASCADE`).
 - **Descargar es SIEMPRE explícito**: `/api/orpheus/download` es la única
   ruta que llama a `qbittorrent_client.add_torrent()` — solo se dispara tras
   el clic en "Descargar" de un torrent concreto ya mostrado (con confirm()
   en el frontend). Nunca se añade nada a qBittorrent automáticamente desde
   `scan.py` ni desde `/api/availability`.
-- **Discografía = MusicBrainz release-groups, tipo Album/EP**:
+- **Discografía = MusicBrainz release-groups, tipo Album/EP/Single**:
   `clients/musicbrainz_client.py::discography()` excluye release-groups cuyo
   ÚNICO secondary-type sea Live/Compilation/Remix/DJ-mix/Soundtrack/etc.
   (`_EXCLUDED_SECONDARY_TYPES`) — si quieres que cuenten, hay que tocar esa

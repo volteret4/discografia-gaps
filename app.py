@@ -10,7 +10,9 @@ import json
 import os
 import sqlite3
 import subprocess
-from datetime import datetime, timedelta, timezone
+import threading
+import time
+from datetime import datetime, timezone
 
 from flask import Flask, jsonify, render_template, request
 
@@ -20,7 +22,9 @@ from scan import init_db
 
 app = Flask(__name__)
 
-AVAILABILITY_CACHE_DAYS = 7
+# Pausa entre discos al comprobar todos los de un artista (Orpheus ya
+# espera _REQUEST_DELAY entre torrentgroups dentro de cada búsqueda).
+BULK_AVAILABILITY_DELAY = 2.0
 
 # ── Panel de configuracion (⚙) — mismo patron que artist-sync/trasvase ─────
 SETTINGS_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -234,6 +238,14 @@ def api_artist_albums(artist_id):
            ORDER BY first_release_date IS NULL, first_release_date""",
         (artist_id,),
     ).fetchall()
+    stored = {}
+    for r in conn.execute(
+        """SELECT av.release_group_id, av.source, av.url, av.meta, av.checked_at
+           FROM availability av JOIN release_groups rg ON rg.id = av.release_group_id
+           WHERE rg.artist_id=? ORDER BY av.checked_at""",
+        (artist_id,),
+    ):
+        stored.setdefault(r["release_group_id"], {})[r["source"]] = r
     conn.close()
     return jsonify({
         "artist": {"id": artist["id"], "name": artist["name"]},
@@ -245,6 +257,7 @@ def api_artist_albums(artist_id):
                 "first_release_date": a["first_release_date"],
                 "have": bool(a["have"]),
                 "have_sources": (a["have_sources"] or "").split(",") if a["have_sources"] else [],
+                "availability": _availability_result(stored.get(a["id"])),
             }
             for a in albums
         ],
@@ -255,28 +268,71 @@ def api_artist_albums(artist_id):
 # API — disponibilidad (bajo demanda) y descarga
 # ---------------------------------------------------------------------------
 
-def _cached_availability(conn, release_group_id):
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=AVAILABILITY_CACHE_DAYS)).isoformat()
+def _stored_availability(conn, release_group_id):
+    """Último resultado guardado por fuente. Ya no caduca: se queda en la BD
+    hasta que se pida actualizarlo (botón ↻ / refresh=1)."""
     rows = conn.execute(
-        "SELECT source, url, meta, checked_at FROM availability WHERE release_group_id=? AND checked_at >= ?",
-        (release_group_id, cutoff),
+        "SELECT source, url, meta, checked_at FROM availability WHERE release_group_id=? ORDER BY checked_at",
+        (release_group_id,),
     ).fetchall()
-    return {r["source"]: r for r in rows}
+    return {r["source"]: r for r in rows}  # el más reciente pisa a los anteriores
 
 
 def _store_availability(conn, release_group_id, source, url, meta):
     now = datetime.now(timezone.utc).isoformat()
+    conn.execute("DELETE FROM availability WHERE release_group_id=? AND source=?", (release_group_id, source))
     conn.execute(
         """INSERT INTO availability(release_group_id, source, url, meta, checked_at) VALUES(?, ?, ?, ?, ?)""",
         (release_group_id, source, url, json.dumps(meta) if meta is not None else None, now),
     )
 
 
+def _availability_result(stored):
+    """Filas guardadas -> el JSON que pinta la web (None si nunca se comprobó)."""
+    if not stored:
+        return None
+    result = {"checked_at": max(r["checked_at"] for r in stored.values())}
+    if "orpheus" in stored:
+        r = stored["orpheus"]
+        result["orpheus"] = {"url": r["url"], "torrents": json.loads(r["meta"]) if r["meta"] else []}
+    for source in ("youtube", "bandcamp"):
+        if source in stored:
+            result[source] = {"url": stored[source]["url"]}
+    return result
+
+
+def _check_availability(conn, release_group_id, artist_name, title, refresh=False):
+    """Comprueba Orpheus/YouTube/Bandcamp para un disco y lo guarda. Sin
+    refresh, solo consulta las fuentes que aún no tienen resultado guardado.
+    Un error de Orpheus no se guarda (se reintentará la próxima vez)."""
+    stored = {} if refresh else _stored_availability(conn, release_group_id)
+    orpheus_error = None
+    if "orpheus" not in stored:
+        if ORPHEUS_APIKEY:
+            try:
+                groups = orpheus_client.search_album(ORPHEUS_APIKEY, artist_name, title)
+                torrents = [t for g in groups for t in g["torrents"]]
+                url = f"https://orpheus.network/torrents.php?id={groups[0]['group_id']}" if groups else None
+                _store_availability(conn, release_group_id, "orpheus", url, torrents)
+            except Exception as exc:
+                orpheus_error = str(exc)
+        else:
+            orpheus_error = "ORPHEUS_APIKEY no configurada"
+    if "youtube" not in stored:
+        _store_availability(conn, release_group_id, "youtube", youtube_client.search_album(artist_name, title), None)
+    if "bandcamp" not in stored:
+        _store_availability(conn, release_group_id, "bandcamp", bandcamp_client.search_album(artist_name, title), None)
+    conn.commit()
+    result = _availability_result(_stored_availability(conn, release_group_id)) or {}
+    if orpheus_error:
+        result["orpheus"] = {"error": orpheus_error}
+    return result
+
+
 @app.route("/api/availability/<int:release_group_id>", methods=["POST"])
 def api_availability(release_group_id):
-    """Bajo demanda: comprueba Orpheus/YouTube/Bandcamp para ESTE disco y
-    cachea el resultado (AVAILABILITY_CACHE_DAYS) para no repetir scraping /
-    gastar rate-limit de Orpheus en cada re-visita a la pagina."""
+    """Comprueba Orpheus/YouTube/Bandcamp para ESTE disco. Lo ya guardado se
+    devuelve tal cual (no caduca); ?refresh=1 vuelve a consultarlo todo."""
     conn = get_db()
     row = conn.execute(
         """SELECT rg.title, a.name AS artist_name
@@ -287,42 +343,78 @@ def api_availability(release_group_id):
     if not row:
         conn.close()
         return jsonify({"error": "Disco no encontrado"}), 404
-
-    cached = _cached_availability(conn, release_group_id)
-    result = {}
-
-    if "orpheus" in cached:
-        r = cached["orpheus"]
-        result["orpheus"] = {"url": r["url"], "torrents": json.loads(r["meta"]) if r["meta"] else []}
-    elif ORPHEUS_APIKEY:
-        try:
-            groups = orpheus_client.search_album(ORPHEUS_APIKEY, row["artist_name"], row["title"])
-            torrents = [t for g in groups for t in g["torrents"]]
-            url = f"https://orpheus.network/torrents.php?id={groups[0]['group_id']}" if groups else None
-            _store_availability(conn, release_group_id, "orpheus", url, torrents)
-            result["orpheus"] = {"url": url, "torrents": torrents}
-        except Exception as exc:
-            result["orpheus"] = {"error": str(exc)}
-    else:
-        result["orpheus"] = {"error": "ORPHEUS_APIKEY no configurada"}
-
-    if "youtube" in cached:
-        result["youtube"] = {"url": cached["youtube"]["url"]}
-    else:
-        url = youtube_client.search_album(row["artist_name"], row["title"])
-        _store_availability(conn, release_group_id, "youtube", url, None)
-        result["youtube"] = {"url": url}
-
-    if "bandcamp" in cached:
-        result["bandcamp"] = {"url": cached["bandcamp"]["url"]}
-    else:
-        url = bandcamp_client.search_album(row["artist_name"], row["title"])
-        _store_availability(conn, release_group_id, "bandcamp", url, None)
-        result["bandcamp"] = {"url": url}
-
-    conn.commit()
+    result = _check_availability(conn, release_group_id, row["artist_name"], row["title"],
+                                 refresh=request.args.get("refresh") == "1")
     conn.close()
     return jsonify(result)
+
+
+# ── Disponibilidad de todos los discos de un artista (en segundo plano) ──────
+# Un único trabajo a la vez: todos tiran del mismo rate-limit de Orpheus.
+
+_bulk_lock = threading.Lock()
+_bulk_job = {"running": False, "artist_id": None, "artist_name": None,
+             "total": 0, "done": 0, "current": None, "errors": 0, "finished_at": None}
+
+
+def _run_bulk_availability(artist_id, artist_name, albums, refresh):
+    conn = get_db()
+    try:
+        for rg_id, title in albums:
+            with _bulk_lock:
+                _bulk_job["current"] = title
+            try:
+                res = _check_availability(conn, rg_id, artist_name, title, refresh=refresh)
+                failed = "error" in res.get("orpheus", {})
+            except Exception:
+                failed = True
+            with _bulk_lock:
+                _bulk_job["done"] += 1
+                _bulk_job["errors"] += int(failed)
+            time.sleep(BULK_AVAILABILITY_DELAY)
+    finally:
+        conn.close()
+        with _bulk_lock:
+            _bulk_job.update(running=False, current=None, finished_at=time.time())
+
+
+@app.route("/api/artists/<int:artist_id>/availability", methods=["POST"])
+def api_artist_availability(artist_id):
+    """Busca disponibilidad de todos los discos que faltan del artista. Sin
+    refresh, salta los que ya tienen resultado guardado."""
+    refresh = (request.get_json(silent=True) or {}).get("refresh") is True
+    conn = get_db()
+    artist = conn.execute("SELECT id, name FROM artists WHERE id=?", (artist_id,)).fetchone()
+    if not artist:
+        conn.close()
+        return jsonify({"error": "Artista no encontrado"}), 404
+    albums = conn.execute(
+        """SELECT rg.id, rg.title FROM release_groups rg
+           WHERE rg.artist_id=? AND rg.have=0
+             AND (? OR NOT EXISTS (SELECT 1 FROM availability av WHERE av.release_group_id = rg.id))
+           ORDER BY rg.first_release_date IS NULL, rg.first_release_date""",
+        (artist_id, 1 if refresh else 0),
+    ).fetchall()
+    conn.close()
+    with _bulk_lock:
+        if _bulk_job["running"]:
+            return jsonify({"error": f"Ya se está comprobando {_bulk_job['artist_name']}"}), 409
+        if not albums:
+            return jsonify({"ok": True, "total": 0})
+        _bulk_job.update(running=True, artist_id=artist_id, artist_name=artist["name"],
+                         total=len(albums), done=0, current=None, errors=0, finished_at=None)
+    threading.Thread(
+        target=_run_bulk_availability,
+        args=(artist_id, artist["name"], [(a["id"], a["title"]) for a in albums], refresh),
+        daemon=True,
+    ).start()
+    return jsonify({"ok": True, "total": len(albums)})
+
+
+@app.route("/api/availability/job")
+def api_availability_job():
+    with _bulk_lock:
+        return jsonify(dict(_bulk_job))
 
 
 @app.route("/api/orpheus/download", methods=["POST"])
