@@ -166,9 +166,17 @@ def sync_artist_universe(conn):
     prune_orphan_artists(conn)
 
 
-def sync_discography(conn, force=False):
+def sync_discography(conn, force=False, stale_hours=None):
     if force:
         rows = conn.execute("SELECT id, name, mbid FROM artists WHERE mbid IS NOT NULL").fetchall()
+    elif stale_hours is not None:
+        # Reintentar solo lo que falló en un sync reciente (no actualizó discography_synced_at)
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=stale_hours)).isoformat()
+        rows = conn.execute(
+            """SELECT id, name, mbid FROM artists WHERE mbid IS NOT NULL
+               AND (discography_synced_at IS NULL OR discography_synced_at < ?)""",
+            (cutoff,),
+        ).fetchall()
     else:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=DISCOGRAPHY_REFRESH_DAYS)).isoformat()
         rows = conn.execute(
@@ -274,6 +282,9 @@ def main():
     parser.add_argument("--only", help="Lista separada por comas: universe,discography,have")
     parser.add_argument("--force-discography", action="store_true",
                          help="Reescanea la discografia de TODOS los artistas, no solo los pendientes/caducados")
+    parser.add_argument("--stale-hours", type=float,
+                         help="Reescanea la discografia de los artistas no sincronizados en las ultimas N horas "
+                              "(p.ej. los que fallaron en un --force-discography reciente)")
     args = parser.parse_args()
 
     phases = list(PHASES)
@@ -292,7 +303,7 @@ def main():
         print(f"Sincronizando {phase}...")
         try:
             if phase == "discography":
-                sync_discography(conn, force=args.force_discography)
+                sync_discography(conn, force=args.force_discography, stale_hours=args.stale_hours)
             else:
                 PHASES[phase](conn)
         except Exception as exc:

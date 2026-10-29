@@ -22,10 +22,18 @@ def _headers(contact_email):
 
 
 def _get(url, params, headers, timeout, retries=4):
-    """GET con reintentos: MusicBrainz responde 503 (y a veces 429) cuando se
-    pasa el ritmo -- sin esto, el sync completo se saltaba ~10% de artistas."""
+    """GET con reintentos: cuando la IP se pasa de ritmo, MusicBrainz responde
+    503 (a veces 429) o directamente corta la conexión (SSLEOFError /
+    ConnectionError) -- sin esto, un sync completo se saltaba cientos de
+    artistas, sobre todo si otro servicio del mismo servidor consulta MB a la vez."""
     for attempt in range(retries):
-        resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+        except requests.exceptions.ConnectionError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(5 * (attempt + 1))
+            continue
         if resp.status_code not in (429, 503) or attempt == retries - 1:
             resp.raise_for_status()
             return resp

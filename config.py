@@ -28,7 +28,9 @@ MUSPY_PASSWORD = os.environ.get("MUSPY_PASSWORD", "")
 AIRSONIC_URL          = os.environ.get("AIRSONIC_URL", "http://localhost:4040")
 AIRSONIC_USER         = os.environ.get("AIRSONIC_USER", "admin")
 AIRSONIC_PASSWORD     = os.environ.get("AIRSONIC_PASSWORD", "")
-AIRSONIC_API_VERSION  = os.environ.get("AIRSONIC_API_VERSION", "1.15.0")
+# `or`: una línea "AIRSONIC_API_VERSION=" vacía en el .env manda v= en blanco y
+# Airsonic responde "Required parameter is missing" a todo.
+AIRSONIC_API_VERSION  = os.environ.get("AIRSONIC_API_VERSION") or "1.15.0"
 
 # Last.fm — igual que artist-sync: espejo compartido (lastfm_data) primero,
 # API directa como fallback. Aquí solo se usa para AÑADIR artistas al
