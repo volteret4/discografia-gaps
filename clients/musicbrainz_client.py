@@ -21,10 +21,20 @@ def _headers(contact_email):
     return {"User-Agent": f"discografia-gaps/1.0 ({contact_email})"}
 
 
+def _get(url, params, headers, timeout, retries=4):
+    """GET con reintentos: MusicBrainz responde 503 (y a veces 429) cuando se
+    pasa el ritmo -- sin esto, el sync completo se saltaba ~10% de artistas."""
+    for attempt in range(retries):
+        resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+        if resp.status_code not in (429, 503) or attempt == retries - 1:
+            resp.raise_for_status()
+            return resp
+        time.sleep(5 * (attempt + 1))
+
+
 def search_mbid(artist_name, contact_email="admin@localhost"):
     params = {"query": f"artist:{artist_name}", "fmt": "json", "limit": 1}
-    resp = requests.get(SEARCH_URL, params=params, headers=_headers(contact_email), timeout=10)
-    resp.raise_for_status()
+    resp = _get(SEARCH_URL, params, _headers(contact_email), 10)
     artists = resp.json().get("artists", [])
     if not artists:
         return None
@@ -50,8 +60,7 @@ def discography(artist_mbid, contact_email="admin@localhost", types=("album", "e
             "limit": PAGE_SIZE,
             "offset": offset,
         }
-        resp = requests.get(RELEASE_GROUP_URL, params=params, headers=headers, timeout=15)
-        resp.raise_for_status()
+        resp = _get(RELEASE_GROUP_URL, params, headers, 15)
         data = resp.json()
 
         for rg in data.get("release-groups", []):
