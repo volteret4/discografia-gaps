@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>discografia-gaps</title>
+<!-- Iconos Airsonic / qBittorrent / escuchado / Mix (servicio ya-lo-tengo) -->
+<script>(function(){var s=document.createElement('script');s.src=location.protocol+'//'+location.hostname+':8780/owned-badges.js';document.head.appendChild(s);})();</script>
 <style>
 :root{
   --g:#00d4ff;--gd:#00a8cc;--gk:#001e26;--gg:0 0 8px #00d4ff66;--gg2:0 0 16px #00d4ff88;
@@ -94,6 +96,22 @@ label.chk{display:flex;align-items:center;gap:.35rem;color:#666;font-size:.75rem
 .artist-tools { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; padding: .5rem 0 .4rem 2rem; }
 .artist-tools .bulk-status { font-size: .78rem; }
 .avail-checked { font-size: .72rem; margin-left: .3rem; }
+.orph-link{color:var(--orph);font-size:.72rem;text-decoration:none;white-space:nowrap;margin-left:.4rem}
+.orph-link:hover{text-decoration:underline}
+.orph-link.search{opacity:.6}
+.yt-embed{width:100%;max-width:560px;aspect-ratio:16/9;border:1px solid var(--br);border-radius:4px;margin-top:.45rem;display:block}
+button.link-chip{cursor:pointer;font:inherit}
+#job-panel{position:fixed;right:.8rem;bottom:3.2rem;width:340px;max-width:calc(100vw - 2rem);z-index:200;
+  background:var(--bg2);border:1px solid var(--bh);border-radius:6px;box-shadow:0 8px 30px #000c;padding:.7rem .85rem;
+  display:flex;flex-direction:column;gap:.4rem}
+#job-panel[hidden]{display:none}
+#job-panel .jp-head{display:flex;justify-content:space-between;align-items:center;color:var(--th);font-size:.78rem}
+#job-panel .jp-close{background:none;border:none;color:#666;cursor:pointer;font-size:1rem;line-height:1}
+#job-panel .jp-bar{height:6px;background:var(--bg3);border-radius:3px;overflow:hidden}
+#job-panel .jp-fill{height:100%;width:0;background:var(--g);box-shadow:var(--gg);transition:width .4s}
+#job-panel.done .jp-fill{background:var(--green)}
+#job-panel .jp-meta{display:flex;justify-content:space-between;font-size:.7rem;color:#777}
+#job-panel .jp-current{font-size:.72rem;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 </style>
 </head>
 <body>
@@ -117,12 +135,37 @@ label.chk{display:flex;align-items:center;gap:.35rem;color:#666;font-size:.75rem
 
 <div class="log-box" id="log-box"></div>
 
+<div id="job-panel" hidden>
+  <div class="jp-head"><span class="jp-title"></span><button class="jp-close" title="Ocultar">×</button></div>
+  <div class="jp-bar"><div class="jp-fill"></div></div>
+  <div class="jp-meta"><span class="jp-count"></span><span class="jp-errors"></span></div>
+  <div class="jp-current"></div>
+</div>
+
 <script>
 const PAGE_SIZE = 60;
 let ARTISTS = [];
 let currentPage = 0;
 const albumsCache = {};   // artist_id -> albums[] (cada uno con su availability guardada)
 let bulkPoller = null;
+
+function escAttr(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+function artistName(artistId) {
+  const a = ARTISTS.find(x => x.id === artistId);
+  return a ? a.name : '';
+}
+
+function orpheusSearchUrl(artist, title) {
+  return 'https://orpheus.network/torrents.php?' + new URLSearchParams({ artistname: artist, groupname: title });
+}
+
+function youtubeId(url) {
+  const m = /[?&]v=([A-Za-z0-9_-]{11})/.exec(url || '');
+  return m ? m[1] : null;
+}
 
 function el(tag, props) { const e = document.createElement(tag); if (props) Object.assign(e, props); return e; }
 
@@ -194,7 +237,7 @@ function renderList() {
     const missingClass = a.missing_count === 0 ? 'zero' : 'some';
     head.innerHTML = `
       <span class="caret">▶</span>
-      <span class="artist-name">${a.name}</span>
+      <span class="artist-name" data-owned-artist="${escAttr(a.name)}">${a.name}</span>
       <span class="artist-srcs">${a.sources.map(s => `<span class="src-badge">${s}</span>`).join('')}</span>
       <span class="missing-count ${missingClass}">${a.missing_count}/${a.total_count}</span>
     `;
@@ -216,9 +259,9 @@ async function toggleArtist(wrap, artistId) {
     albumsCache[artistId] = data.albums || [];
   }
   renderAlbums(albumsDiv, albumsCache[artistId], artistId);
-  // Si hay una búsqueda masiva de este artista en curso (p.ej. tras recargar), seguirla
+  // Si hay una búsqueda masiva en curso (p.ej. tras recargar), seguirla
   const job = await api('/api/availability/job');
-  if (job.running && job.artist_id === artistId) pollBulk(artistId);
+  if (job.running) pollBulk();
 }
 
 async function reloadArtistAlbums(artistId) {
@@ -250,13 +293,18 @@ function renderAlbums(container, albums, artistId) {
     tools.appendChild(el('span', { className: 'bulk-status dim' }));
     container.appendChild(tools);
   }
+  const artist = artistName(artistId);
   for (const al of albums) {
     const row = el('div', { className: 'album-row' + (al.have ? ' have' : ''), id: `album-${al.id}` });
     const year = (al.first_release_date || '').slice(0, 4);
+    const orphUrl = al.availability && al.availability.orpheus && al.availability.orpheus.url;
     row.innerHTML = `
-      <span class="album-title">${al.title}</span>
+      <span class="album-title" data-owned-artist="${escAttr(artist)}" data-owned-album="${escAttr(al.title)}">${al.title}</span>
       <span class="album-type">${al.primary_type || '?'}</span>
       <span class="album-year">${year}</span>
+      <a class="orph-link${orphUrl ? '' : ' search'}" target="_blank" rel="noopener"
+         href="${escAttr(orphUrl || orpheusSearchUrl(artist, al.title))}"
+         title="${orphUrl ? 'Ver el grupo en Orpheus' : 'Buscar en Orpheus'}">◈ Orpheus</a>
     `;
     container.appendChild(row);
     if (al.have) {
@@ -295,24 +343,49 @@ async function startBulk(artistId, refresh) {
   const data = await r.json();
   if (data.error) { showLog(data.error, true); return; }
   if (!data.total) { showLog('No hay discos que comprobar', false); return; }
-  pollBulk(artistId);
+  jobPanelHidden = false;
+  pollBulk();
 }
 
-function pollBulk(artistId) {
-  clearInterval(bulkPoller);
+// ── Panel de progreso (búsqueda de disponibilidad en segundo plano) ─────
+let jobPanelHidden = false;
+
+document.querySelector('#job-panel .jp-close').addEventListener('click', () => {
+  jobPanelHidden = true;
+  document.getElementById('job-panel').hidden = true;
+});
+
+function renderJobPanel(job) {
+  const panel = document.getElementById('job-panel');
+  if (jobPanelHidden || !job.artist_id) { panel.hidden = true; return; }
+  panel.hidden = false;
+  panel.classList.toggle('done', !job.running);
+  const pct = job.total ? Math.round(job.done / job.total * 100) : 0;
+  panel.querySelector('.jp-title').textContent =
+    (job.running ? '⏳ Buscando disponibilidad: ' : '✓ Disponibilidad comprobada: ') + job.artist_name;
+  panel.querySelector('.jp-fill').style.width = (job.running ? pct : 100) + '%';
+  panel.querySelector('.jp-count').textContent = `${job.done} / ${job.total} discos · ${pct}%`;
+  panel.querySelector('.jp-errors').textContent = job.errors ? `${job.errors} con error en Orpheus` : '';
+  panel.querySelector('.jp-current').textContent = job.running && job.current ? '♪ ' + job.current : '';
+}
+
+function pollBulk() {
+  if (bulkPoller) return;
+  let artistId = null;
   const tick = async () => {
     const job = await api('/api/availability/job');
-    const wrap = document.getElementById(`artist-${artistId}`);
+    artistId = job.artist_id;
+    renderJobPanel(job);
+    document.querySelectorAll('.artist-tools button').forEach(b => b.disabled = job.running);
+    const wrap = artistId && document.getElementById(`artist-${artistId}`);
     const status = wrap && wrap.querySelector('.bulk-status');
-    if (status) status.textContent = job.running
-      ? `⏳ ${job.done}/${job.total}${job.current ? ' · ' + job.current : ''}`
-      : '';
-    if (wrap) wrap.querySelectorAll('.artist-tools button').forEach(b => b.disabled = job.running);
+    if (status) status.textContent = job.running ? `⏳ ${job.done}/${job.total}` : '';
     if (!job.running) {
       clearInterval(bulkPoller);
       bulkPoller = null;
-      await reloadArtistAlbums(artistId);
+      if (artistId && albumsCache[artistId]) await reloadArtistAlbums(artistId);
       showLog(`Disponibilidad comprobada: ${job.done} discos` + (job.errors ? ` (${job.errors} con error en Orpheus)` : ''), job.errors > 0);
+      setTimeout(() => { document.getElementById('job-panel').hidden = true; }, 8000);
     }
   };
   bulkPoller = setInterval(tick, 2000);
@@ -343,9 +416,25 @@ function renderAvailability(row, data) {
     rowEl.appendChild(el('span', { className: 'dim', textContent: 'No encontrado en Orpheus' }));
   }
 
+  let ytBtn = null;
   if (data.youtube && data.youtube.url) {
-    const a = el('a', { className: 'link-chip yt', href: data.youtube.url, target: '_blank', textContent: '▶ YouTube' });
-    rowEl.appendChild(a);
+    const vid = youtubeId(data.youtube.url);
+    if (vid) {
+      ytBtn = el('button', { className: 'link-chip yt', textContent: '▶ YouTube', title: 'Mostrar/ocultar el vídeo' });
+      ytBtn.addEventListener('click', () => {
+        const open = availWrap.querySelector('.yt-embed');
+        if (open) { open.remove(); ytBtn.textContent = '▶ YouTube'; return; }
+        const frame = el('iframe', {
+          className: 'yt-embed', src: `https://www.youtube.com/embed/${vid}?rel=0&autoplay=1`,
+          allow: 'autoplay; encrypted-media; picture-in-picture', allowFullscreen: true,
+        });
+        availWrap.appendChild(frame);
+        ytBtn.textContent = '■ Cerrar vídeo';
+      });
+    } else {
+      ytBtn = el('a', { className: 'link-chip yt', href: data.youtube.url, target: '_blank', textContent: '▶ YouTube' });
+    }
+    rowEl.appendChild(ytBtn);
   }
   if (data.bandcamp && data.bandcamp.url) {
     const a = el('a', { className: 'link-chip bc', href: data.bandcamp.url, target: '_blank', textContent: '♪ Bandcamp' });
@@ -405,6 +494,7 @@ document.getElementById('only-missing').addEventListener('change', () => { curre
 loadArtists();
 loadLastSync();
 </script>
-<script src="/static/settings-panel.js"></script>
+<script src="/static/settings-panel.js">api('/api/availability/job').then(job => { if (job.running) pollBulk(); });
+</script>
 </body>
 </html>
