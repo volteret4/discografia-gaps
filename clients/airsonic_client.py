@@ -9,6 +9,11 @@ class AirsonicError(Exception):
     pass
 
 
+# Si el servidor rechaza la auth por token una vez, se recuerda para el resto
+# del proceso (un sync hace una llamada por artista).
+_plain_auth = False
+
+
 def _params(user, password, version, use_token=True, **extra):
     base = {"u": user, "v": version, "c": "discografia-gaps", "f": "json"}
     if use_token:
@@ -41,7 +46,8 @@ def _call(base_url, user, password, version, endpoint, **kwargs):
 
     Asi el usuario no tiene que adivinar ni AIRSONIC_API_VERSION ni el modo
     de auth a mano."""
-    use_token = True
+    global _plain_auth
+    use_token = not _plain_auth
     data = _raw_call(base_url, user, password, version, endpoint, use_token, **kwargs)
 
     if data.get("status") != "ok":
@@ -56,9 +62,10 @@ def _call(base_url, user, password, version, endpoint, **kwargs):
                 data = _raw_call(base_url, user, password, version, endpoint, use_token, **kwargs)
                 err = data.get("error", {}) if data.get("status") != "ok" else {}
 
-        if data.get("status") != "ok" and "non-hashed" in (err.get("message") or "").lower():
-            print("  [airsonic] el servidor no acepta auth por token, reintentando con password en claro")
+        if use_token and data.get("status") != "ok" and "non-hashed" in (err.get("message") or "").lower():
+            print("  [airsonic] el servidor no acepta auth por token, se usa password en claro")
             use_token = False
+            _plain_auth = True
             data = _raw_call(base_url, user, password, version, endpoint, use_token, **kwargs)
 
         if data.get("status") != "ok":
