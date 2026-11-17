@@ -97,3 +97,30 @@ Este proyecto todavía no está enganchado como submodule de `../tumtumpa`
 (`services/discografia-gaps`) ni tiene entrada en su `docker-compose.yml` —
 hace falta crear el repo en GitHub y decidir el puerto host antes de ese
 paso. Ver `CLAUDE.md` para el resto de contexto de arquitectura.
+
+## Instalación con Docker Compose
+
+```bash
+cp .env.example .env
+```
+
+Rellena `.env` (credenciales y carpetas de tu equipo) y arranca:
+
+```bash
+docker compose up -d --build
+```
+
+Los datos que genera (bases, cachés) se quedan en esta misma carpeta, fuera de git.
+
+## Actualizaciones automáticas
+
+El `docker-compose.yml` trae su propia [Ofelia](https://github.com/mcuadros/ofelia), que lanza dentro del contenedor los mismos trabajos y a las mismas horas que en REPEAT-ONE (formato con segundos: `seg min hora día mes día-semana`, hora de `TZ`, por defecto Europe/Madrid):
+
+| Trabajo | Cuándo | Qué lanza |
+|---|---|---|
+| `discografia-gaps-scan` | `0 30 5 * * *` | `python3 scan.py --only universe,have` |
+| `discografia-gaps-discography` | `0 35 5 * * 0` | `python3 scan.py --only discography` |
+
+Para cambiar una hora, edita su etiqueta `ofelia.job-exec.<trabajo>.schedule` en `docker-compose.yml` y vuelve a hacer `docker compose up -d`. Para lanzarlo a mano: `docker compose exec <servicio> <orden>`. Para no tener actualizaciones automáticas: `docker compose stop ofelia`.
+
+Esta Ofelia solo ve los contenedores de este repo (etiqueta `repeat-one.ofelia`), así que puedes tener varios módulos instalados por separado sin que se pisen. Necesita el socket de Docker en solo lectura.
